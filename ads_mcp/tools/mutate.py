@@ -443,6 +443,11 @@ def campaign_update_settings(
     text_customization / final_url_expansion toggle its sub-settings
     (asset automation OPTED_IN/OPTED_OUT).
 
+    NOTE: the Demand Gen "Asset optimization" toggles (shorter/resized
+    videos, landing page previews) are NOT campaign-level — they live on
+    each video ad. Use ad_group_ad_update_asset_optimization for existing
+    DG ads, or set them at creation via demandgen_ad_create_video.
+
     SAFETY: dry-run by default (validate_only); re-run with confirm=true.
     """
     customer_id = _clean_customer_id(customer_id)
@@ -540,6 +545,74 @@ def campaign_update_settings(
     if confirm:
         details["updated_resource"] = response.results[0].resource_name
     return _preview_or_done(confirm, "campaign_update_settings", details)
+
+
+@mutate_mcp.tool(annotations=_WRITE_ANNOTATIONS)
+def campaign_rename(
+    customer_id: str,
+    campaign_id: str,
+    name: str,
+    confirm: bool = False,
+) -> Dict[str, Any]:
+    """Renames an existing campaign (changes campaign.name).
+
+    Campaign names must be unique within the account; a duplicate name is
+    rejected by the API. The preview shows the current name and the new one.
+
+    SAFETY: dry-run by default (validate_only); re-run with confirm=true.
+
+    Args:
+        customer_id: The client account id (digits only, no hyphens).
+        campaign_id: The numeric id of the campaign to rename.
+        name: The new campaign name.
+        confirm: False = dry-run preview (default), True = apply.
+    """
+    customer_id = _clean_customer_id(customer_id)
+    new_name = (name or "").strip()
+    if not new_name:
+        raise ToolError("name must be a non-empty string")
+
+    client = utils.get_googleads_client()
+    campaign_service = utils.get_googleads_service("CampaignService")
+    ga_service = utils.get_googleads_service("GoogleAdsService")
+
+    old_name = None
+    for row in ga_service.search(
+        customer_id=customer_id,
+        query=(
+            "SELECT campaign.name FROM campaign "
+            f"WHERE campaign.id = {int(campaign_id)}"
+        ),
+    ):
+        old_name = row.campaign.name
+    if old_name is None:
+        raise ToolError(f"Campaign {campaign_id} not found in {customer_id}")
+
+    operation = client.get_type("CampaignOperation")
+    campaign = operation.update
+    campaign.resource_name = f"customers/{customer_id}/campaigns/{campaign_id}"
+    campaign.name = new_name
+    operation.update_mask.paths.append("name")
+
+    request = client.get_type("MutateCampaignsRequest")
+    request.customer_id = customer_id
+    request.operations.append(operation)
+    request.validate_only = not confirm
+
+    try:
+        response = campaign_service.mutate_campaigns(request=request)
+    except GoogleAdsException as ex:
+        _raise_tool_error(ex)
+
+    details: Dict[str, Any] = {
+        "customer_id": customer_id,
+        "campaign_id": str(campaign_id),
+        "old_name": old_name,
+        "new_name": new_name,
+    }
+    if confirm:
+        details["updated_resource"] = response.results[0].resource_name
+    return _preview_or_done(confirm, "campaign_rename", details)
 
 
 @mutate_mcp.tool(annotations=_WRITE_ANNOTATIONS)

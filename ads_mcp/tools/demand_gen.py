@@ -270,6 +270,12 @@ def campaign_create(
         target_roas: Optional target ROAS as decimal (3.5 = 350%).
         status: PAUSED (default) or ENABLED.
         confirm: False = dry-run preview (default), True = apply.
+
+    NOTE: the Demand Gen "Asset optimization" toggles (shorter videos,
+    resized videos, landing page previews) are NOT campaign-level in the
+    Google Ads API — they live on each video ad. Set them via
+    demandgen_ad_create_video (asset_optimization / shorter_videos /
+    resized_videos / landing_page_previews).
     """
     customer_id = _clean_customer_id(customer_id)
     bidding_strategy = bidding_strategy.upper()
@@ -841,6 +847,10 @@ def ad_create_video(
     call_to_action: Optional[str] = None,
     tracking_url_template: Optional[str] = None,
     status: str = "PAUSED",
+    asset_optimization: Optional[bool] = None,
+    shorter_videos: Optional[bool] = None,
+    resized_videos: Optional[bool] = None,
+    landing_page_previews: Optional[bool] = None,
     confirm: bool = False,
 ) -> Dict[str, Any]:
     """Creates a Demand Gen video responsive ad.
@@ -866,6 +876,15 @@ def ad_create_video(
         descriptions: 1-5 descriptions, max 90 chars.
         logo_image_asset_ids: 1-5 logo image asset ids.
         status: PAUSED (default) or ENABLED.
+        asset_optimization: Master toggle for this ad's "Asset optimization"
+            (Demand Gen auto-generated assets). False opts OUT of shorter
+            videos, resized/vertical videos and landing page previews; True
+            opts in. None = Google defaults. Granular flags override it.
+            NOTE: for Demand Gen these settings live on the AD (ad_group_ad),
+            not the campaign — that is why they are set here.
+        shorter_videos: Auto-generate shorter YouTube videos (False=off).
+        resized_videos: Auto-generate resized/vertical videos (False=off).
+        landing_page_previews: Auto-generate landing page previews (False=off).
         confirm: False = dry-run preview (default), True = apply.
     """
     customer_id = _clean_customer_id(customer_id)
@@ -938,6 +957,34 @@ def ad_create_video(
         cta_ref.asset = a_resp.results[0].resource_name
         dg.call_to_actions.append(cta_ref)
 
+    # Ad-level "Asset optimization" (Demand Gen): opt in/out of the
+    # auto-generated shorter/vertical videos and landing page previews.
+    # These live on ad_group_ad, NOT the campaign (Google Ads API design).
+    _sv, _rv, _lpp = shorter_videos, resized_videos, landing_page_previews
+    if asset_optimization is not None:
+        if _sv is None:
+            _sv = asset_optimization
+        if _rv is None:
+            _rv = asset_optimization
+        if _lpp is None:
+            _lpp = asset_optimization
+    if any(x is not None for x in (_sv, _rv, _lpp)):
+        t_enum = client.enums.AssetAutomationTypeEnum
+        s_enum = client.enums.AssetAutomationStatusEnum
+        for auto_type, flag in (
+            (t_enum.GENERATE_SHORTER_YOUTUBE_VIDEOS, _sv),
+            (t_enum.GENERATE_VERTICAL_YOUTUBE_VIDEOS, _rv),
+            (t_enum.GENERATE_LANDING_PAGE_PREVIEW, _lpp),
+        ):
+            if flag is None:
+                continue
+            aa = client.get_type("AdGroupAdAssetAutomationSetting")
+            aa.asset_automation_type = auto_type
+            aa.asset_automation_status = (
+                s_enum.OPTED_IN if flag else s_enum.OPTED_OUT
+            )
+            ad_group_ad.ad_group_ad_asset_automation_settings.append(aa)
+
     request = client.get_type("MutateAdGroupAdsRequest")
     request.customer_id = customer_id
     request.operations.append(operation)
@@ -956,10 +1003,136 @@ def ad_create_video(
         "call_to_action": call_to_action,
         "final_url": final_url,
         "status": status,
+        "asset_optimization": {
+            "shorter_videos": _sv,
+            "resized_videos": _rv,
+            "landing_page_previews": _lpp,
+        },
     }
     if confirm:
         details["created_resource"] = response.results[0].resource_name
     return _preview_or_done(confirm, "demandgen_ad_create_video", details)
+
+
+@demandgen_mcp.tool(annotations=_WRITE)
+def ad_update_asset_optimization(
+    customer_id: str,
+    ad_id: str,
+    asset_optimization: Optional[bool] = None,
+    shorter_videos: Optional[bool] = None,
+    resized_videos: Optional[bool] = None,
+    landing_page_previews: Optional[bool] = None,
+    confirm: bool = False,
+) -> Dict[str, Any]:
+    """Turns the Demand Gen "Asset optimization" toggles on/off for an
+    EXISTING video ad (ad_group_ad).
+
+    In the Google Ads API these settings live on the ad, not the campaign,
+    so pass the ad id (ad_group_ad.ad.id). asset_optimization is a master
+    switch (False = turn all three off); shorter_videos / resized_videos /
+    landing_page_previews override it per-toggle. The existing settings are
+    read and merged, so untouched toggles are preserved.
+
+    SAFETY: dry-run by default (validate_only); re-run with confirm=true.
+
+    Args:
+        customer_id: The client account id (digits only, no hyphens).
+        ad_id: The numeric ad id (ad_group_ad.ad.id) of the DG video ad.
+        asset_optimization: Master toggle; False turns all three off.
+        shorter_videos: Shorter YouTube videos (False = off).
+        resized_videos: Resized/vertical videos (False = off).
+        landing_page_previews: Landing page previews (False = off).
+        confirm: False = dry-run preview (default), True = apply.
+    """
+    customer_id = _clean_customer_id(customer_id)
+
+    _sv, _rv, _lpp = shorter_videos, resized_videos, landing_page_previews
+    if asset_optimization is not None:
+        if _sv is None:
+            _sv = asset_optimization
+        if _rv is None:
+            _rv = asset_optimization
+        if _lpp is None:
+            _lpp = asset_optimization
+    if all(x is None for x in (_sv, _rv, _lpp)):
+        raise ToolError(
+            "Pass asset_optimization or at least one of shorter_videos / "
+            "resized_videos / landing_page_previews"
+        )
+
+    client = utils.get_googleads_client()
+    ga_service = utils.get_googleads_service("GoogleAdsService")
+    ad_service = utils.get_googleads_service("AdGroupAdService")
+
+    # Resolve the ad_group_ad resource and its current automation settings.
+    ag_ad_rn = None
+    current: Dict[int, int] = {}
+    for row in ga_service.search(
+        customer_id=customer_id,
+        query=(
+            "SELECT ad_group_ad.resource_name, "
+            "ad_group_ad.ad_group_ad_asset_automation_settings "
+            "FROM ad_group_ad "
+            f"WHERE ad_group_ad.ad.id = {int(ad_id)}"
+        ),
+    ):
+        ag_ad_rn = row.ad_group_ad.resource_name
+        for s in row.ad_group_ad.ad_group_ad_asset_automation_settings:
+            current[int(s.asset_automation_type)] = int(
+                s.asset_automation_status
+            )
+    if ag_ad_rn is None:
+        raise ToolError(f"Ad {ad_id} not found in {customer_id}")
+
+    t_enum = client.enums.AssetAutomationTypeEnum
+    s_enum = client.enums.AssetAutomationStatusEnum
+
+    def _set(auto_type, flag):
+        current[int(auto_type)] = int(
+            s_enum.OPTED_IN if flag else s_enum.OPTED_OUT
+        )
+
+    if _sv is not None:
+        _set(t_enum.GENERATE_SHORTER_YOUTUBE_VIDEOS, _sv)
+    if _rv is not None:
+        _set(t_enum.GENERATE_VERTICAL_YOUTUBE_VIDEOS, _rv)
+    if _lpp is not None:
+        _set(t_enum.GENERATE_LANDING_PAGE_PREVIEW, _lpp)
+
+    operation = client.get_type("AdGroupAdOperation")
+    ad_group_ad = operation.update
+    ad_group_ad.resource_name = ag_ad_rn
+    for auto_type, auto_status in sorted(current.items()):
+        aa = client.get_type("AdGroupAdAssetAutomationSetting")
+        aa.asset_automation_type = auto_type
+        aa.asset_automation_status = auto_status
+        ad_group_ad.ad_group_ad_asset_automation_settings.append(aa)
+    operation.update_mask.paths.append(
+        "ad_group_ad_asset_automation_settings"
+    )
+
+    request = client.get_type("MutateAdGroupAdsRequest")
+    request.customer_id = customer_id
+    request.operations.append(operation)
+    request.validate_only = not confirm
+    try:
+        response = ad_service.mutate_ad_group_ads(request=request)
+    except GoogleAdsException as ex:
+        _raise_tool_error(ex)
+
+    details: Dict[str, Any] = {
+        "customer_id": customer_id,
+        "ad_id": str(ad_id),
+        "asset_optimization": {
+            "shorter_videos": _sv,
+            "resized_videos": _rv,
+            "landing_page_previews": _lpp,
+        },
+    }
+    if confirm:
+        details["updated_resource"] = response.results[0].resource_name
+    return _preview_or_done(confirm, "demandgen_ad_update_asset_optimization",
+                            details)
 
 
 @demandgen_mcp.tool(annotations=_WRITE)
