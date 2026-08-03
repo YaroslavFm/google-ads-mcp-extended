@@ -176,56 +176,142 @@ def recommendation_dismiss(
     )
 
 
+def _field_by_path(obj: Any, path: str) -> Any:
+    """Reads a (possibly nested, dotted) field off a proto message, returning
+    a JSON-friendly value. Enums are returned by name."""
+    if obj is None:
+        return None
+    cur = obj
+    try:
+        for part in path.split("."):
+            cur = getattr(cur, part)
+    except AttributeError:
+        return None
+    if isinstance(cur, bool):
+        return cur
+    # proto-plus enums are IntEnum subclasses — return the readable name.
+    if isinstance(cur, int) and hasattr(cur, "name"):
+        return cur.name
+    if isinstance(cur, (str, int, float)):
+        return cur
+    text = str(cur)
+    return text if text else None
+
+
+def _changed_values(
+    resource_type_name: str,
+    old_res: Any,
+    new_res: Any,
+    paths: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Builds {field_path: {"old": ..., "new": ...}} for the changed fields.
+
+    The ChangedResource is a oneof whose populated field matches the
+    change_resource_type (e.g. CAMPAIGN -> .campaign, AD_GROUP_AD ->
+    .ad_group_ad), so we derive the attribute from the type name.
+    """
+    attr = resource_type_name.lower()
+    old_obj = getattr(old_res, attr, None)
+    new_obj = getattr(new_res, attr, None)
+    out: Dict[str, Dict[str, Any]] = {}
+    for path in paths:
+        out[path] = {
+            "old": _field_by_path(old_obj, path),
+            "new": _field_by_path(new_obj, path),
+        }
+    return out
+
+
 @optimize_mcp.tool(annotations=_READ)
 def change_history(
     customer_id: str,
     days: int = 7,
     campaign_id: Optional[str] = None,
     limit: int = 100,
+    manual_only: bool = False,
+    include_values: bool = True,
 ) -> List[Dict[str, Any]]:
     """Shows recent changes in the account: who changed what and when.
 
+    Each row also reports HOW the change was made (``via``: e.g.
+    ``GOOGLE_ADS_WEB_CLIENT`` = a manual change in the UI, ``GOOGLE_ADS_API``,
+    ``GOOGLE_ADS_SCRIPTS``, ``GOOGLE_ADS_BULK_UPLOAD``, ``GOOGLE_ADS_EDITOR``).
+
     Args:
         customer_id: The client account id (digits only, no hyphens).
-        days: Look-back window in days, max 30 (API limit).
+        days: Look-back window in days, max 30 (API limit — the change_event
+            resource does not retain older data).
         campaign_id: Optional filter by campaign.
         limit: Max rows (default 100, API max 10000).
+        manual_only: If true, returns ONLY manual UI changes
+            (client_type = GOOGLE_ADS_WEB_CLIENT), filtered in the query so
+            the limit is not spent on API/script/bulk changes.
+        include_values: If true (default), each row includes a ``changes``
+            map of {field: {"old": ..., "new": ...}} extracted from the
+            change_event old/new resource snapshots.
     """
     customer_id = _clean_customer_id(customer_id)
     days = min(int(days), 30)
     limit = min(int(limit), 10000)
-    end = datetime.date.today()
-    start = end - datetime.timedelta(days=days)
+    now = datetime.datetime.now()
+    start = now - datetime.timedelta(days=days)
+    # The API rejects a start strictly older than 30 days (START_DATE_TOO_OLD);
+    # keep a small safety buffer so days=30 still works.
+    min_start = now - datetime.timedelta(days=30) + datetime.timedelta(minutes=5)
+    if start < min_start:
+        start = min_start
+    start_s = start.strftime("%Y-%m-%d %H:%M:%S")
+    end_s = now.strftime("%Y-%m-%d %H:%M:%S")
 
     where = (
-        f"WHERE change_event.change_date_time >= '{start} 00:00:00' "
-        f"AND change_event.change_date_time <= '{end} 23:59:59' "
+        f"WHERE change_event.change_date_time >= '{start_s}' "
+        f"AND change_event.change_date_time <= '{end_s}' "
     )
     if campaign_id:
         where += f"AND campaign.id = {int(campaign_id)} "
+    if manual_only:
+        where += "AND change_event.client_type = 'GOOGLE_ADS_WEB_CLIENT' "
+
+    fields = (
+        "change_event.change_date_time, change_event.user_email, "
+        "change_event.client_type, change_event.change_resource_type, "
+        "change_event.resource_change_operation, "
+        "change_event.changed_fields"
+    )
+    if include_values:
+        fields += (
+            ", change_event.old_resource, change_event.new_resource"
+        )
 
     ga_service = utils.get_googleads_service("GoogleAdsService")
     query = (
-        "SELECT change_event.change_date_time, change_event.user_email, "
-        "change_event.client_type, change_event.change_resource_type, "
-        "change_event.resource_change_operation, "
-        "change_event.changed_fields "
+        f"SELECT {fields} "
         f"FROM change_event {where} "
         f"ORDER BY change_event.change_date_time DESC LIMIT {limit}"
     )
     try:
         rows = ga_service.search(customer_id=customer_id, query=query)
-        return [
-            {
-                "when": row.change_event.change_date_time,
-                "who": row.change_event.user_email,
-                "via": row.change_event.client_type.name,
-                "resource": row.change_event.change_resource_type.name,
-                "operation": row.change_event.resource_change_operation.name,
-                "fields": list(row.change_event.changed_fields.paths),
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            ce = row.change_event
+            paths = list(ce.changed_fields.paths)
+            item: Dict[str, Any] = {
+                "when": ce.change_date_time,
+                "who": ce.user_email,
+                "via": ce.client_type.name,
+                "resource": ce.change_resource_type.name,
+                "operation": ce.resource_change_operation.name,
+                "fields": paths,
             }
-            for row in rows
-        ]
+            if include_values and paths:
+                item["changes"] = _changed_values(
+                    ce.change_resource_type.name,
+                    ce.old_resource,
+                    ce.new_resource,
+                    paths,
+                )
+            result.append(item)
+        return result
     except GoogleAdsException as ex:
         _raise_tool_error(ex)
 
