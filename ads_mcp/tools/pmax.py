@@ -58,6 +58,9 @@ _MEDIA_FIELD_TYPES = (
     "YOUTUBE_VIDEO",
 )
 
+# Google raised the per-asset-group video cap from 5 to 15 (2025/26).
+_MAX_ASSET_GROUP_VIDEOS = 15
+
 
 def _check_len(items: List[str], max_len: int, label: str) -> None:
     bad = [i for i in items if len(i) > max_len]
@@ -366,7 +369,8 @@ def asset_group_create(
         marketing_image_asset_ids: Landscape image asset ids.
         square_image_asset_ids: Square image asset ids.
         logo_asset_ids: Logo image asset ids.
-        youtube_video_asset_ids: Optional YouTube video asset ids.
+        youtube_video_asset_ids: Optional YouTube video asset ids
+            (up to 15 per asset group — Google raised the cap from 5).
         path1: Optional display path 1 (max 15 chars).
         path2: Optional display path 2 (max 15 chars, requires path1).
         status: PAUSED (default) or ENABLED.
@@ -396,6 +400,11 @@ def asset_group_create(
     _check_len(descriptions, 90, "Descriptions")
     if not any(len(d) <= 60 for d in descriptions):
         raise ToolError("At least one description must be 60 chars or less")
+    if len(youtube_video_asset_ids or []) > _MAX_ASSET_GROUP_VIDEOS:
+        raise ToolError(
+            f"youtube_video_asset_ids: up to {_MAX_ASSET_GROUP_VIDEOS} "
+            "videos per asset group"
+        )
 
     client = utils.get_googleads_client()
     ga_service = utils.get_googleads_service("GoogleAdsService")
@@ -684,7 +693,8 @@ def asset_group_add_media(
         asset_group_id: The numeric id of the asset group.
         asset_ids: Asset ids to link.
         field_type: MARKETING_IMAGE, SQUARE_MARKETING_IMAGE,
-            PORTRAIT_MARKETING_IMAGE, LOGO or YOUTUBE_VIDEO.
+            PORTRAIT_MARKETING_IMAGE, LOGO or YOUTUBE_VIDEO. For
+            YOUTUBE_VIDEO the total (existing + new) may not exceed 15.
         confirm: False = dry-run preview (default), True = apply.
     """
     customer_id = _clean_customer_id(customer_id)
@@ -700,6 +710,30 @@ def asset_group_add_media(
     asset_group_rn = (
         f"customers/{customer_id}/assetGroups/{asset_group_id}"
     )
+
+    # Enforce the per-asset-group video cap (15) counting assets already
+    # linked, so a partial batch doesn't fail cryptically mid-way.
+    if field_type == "YOUTUBE_VIDEO":
+        existing = sum(
+            1
+            for _ in ga_service.search(
+                customer_id=customer_id,
+                query=(
+                    "SELECT asset_group_asset.asset "
+                    "FROM asset_group_asset "
+                    f"WHERE asset_group_asset.asset_group = '{asset_group_rn}' "
+                    "AND asset_group_asset.field_type = 'YOUTUBE_VIDEO' "
+                    "AND asset_group_asset.status != 'REMOVED'"
+                ),
+            )
+        )
+        if existing + len(asset_ids) > _MAX_ASSET_GROUP_VIDEOS:
+            raise ToolError(
+                f"Asset group already has {existing} video(s); adding "
+                f"{len(asset_ids)} would exceed the "
+                f"{_MAX_ASSET_GROUP_VIDEOS}-video limit"
+            )
+
     operations = []
     for asset_id in asset_ids:
         asset_rn = f"customers/{customer_id}/assets/{asset_id}"
